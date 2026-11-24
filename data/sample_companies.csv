@@ -1,16 +1,16 @@
-company_name
-Acme Logistics LLC
-Northwind Manufacturing Co
-Blue River Consulting
-Summit Ridge Hardware
-Cascade Data Systems
-Pioneer Freight Group
-Harbor Point Bakery
-Ironwood Steel Works
-Sunset Media Partners
-Redstone Analytics
-Maple Street Dental
-Vantage Point Insurance
-Golden Gate Textiles
-Timberline Construction
-Echo Valley Software
+company_name,website,oob_flagged,impact
+Acme Logistics LLC,,true,5
+Northwind Manufacturing Co,,true,3
+Blue River Consulting,,true,1
+Summit Ridge Hardware,,true,2
+Cascade Data Systems,,true,4
+Pioneer Freight Group,,true,5
+Harbor Point Bakery,,true,1
+Ironwood Steel Works,,true,3
+Sunset Media Partners,,true,2
+Redstone Analytics,,true,4
+Maple Street Dental,,true,1
+Vantage Point Insurance,,true,5
+Golden Gate Textiles,,true,2
+Timberline Construction,,true,3
+Echo Valley Software,,true,4

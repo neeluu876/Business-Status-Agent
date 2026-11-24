@@ -1,80 +1,109 @@
 # Business Status Verification Agent
 
-An agentic pipeline that verifies whether a company incorrectly flagged as
-**"out of business" (OOB)** in enterprise data (e.g. D&B, CRM, or firmographic
-feeds) is actually still active — and prioritizes which records a data team
-should fix first.
+A prototype that checks whether a company record marked **"out of business"**
+(OOB) is really defunct, and ranks which records are most worth fixing first.
 
-This is a generalized, public version of a data-quality problem I work on
-professionally: enterprise datasets frequently mis-flag active companies as
-defunct due to stale or fragmented signals, which quietly corrupts sales
-pipelines, risk models, and reporting. Manually reviewing every flagged
-record doesn't scale — so this project automates the triage.
+It combines several signals (website, state filing status, news, social
+activity, headcount trend), asks an LLM or a rule engine to classify the
+company, and then ranks a batch by how likely each record's current flag is
+wrong, weighted by business impact.
 
-## What it does
+Most signals in this public demo are **simulated**. The website check can be
+**live**. See "What is real and what is simulated" below.
 
-1. **Collects signals** for a company (website activity, state filing status,
-   news mentions, social activity, headcount trend).
-2. **Reasons over the signals** using an LLM agent (Claude) to classify the
-   company's true status, with a transparent explanation — falling back to a
-   hand-built rule engine if no API key is configured, so the project runs
-   out of the box.
-3. **Prioritizes a worklist**: given a batch of companies, ranks them by how
-   likely the current flag is *wrong* and how much remediation impact fixing
-   it would have — the same logic used to decide which of thousands of
-   flagged records to correct first.
-
-## Why this matters (the real-world version)
-
-At scale, this kind of pipeline is what lets a small data team fix tens of
-thousands of mis-flagged records without manually reviewing each one —
-cutting remediation time dramatically while improving data quality that
-sales, risk, and reporting teams all depend on.
-
-## Architecture
+## How it works
 
 ```
-company name
-     │
-     ▼
- signals.py  ──►  raw signals (web, filings, news, social, headcount)
-     │
-     ▼
-  agent.py   ──►  LLM reasoning (or rule-based fallback)
-     │              │
-     │              ▼
-     │        {status, confidence, reasoning, recommended_action}
-     ▼
-prioritize_worklist()  ──►  ranked remediation queue
+company name (+ optional website, current OOB flag, impact)
+        |
+        v
+  signals.py   website (live or simulated), filings, news, social, headcount (simulated)
+        |
+        v
+  agent.py     Claude classifies status, or a rule engine does if no API key is set
+        |        output: status, confidence active (0-100), reasoning, recommended action
+        v
+  prioritize_worklist()   rank by likelihood the flag is wrong x impact
 ```
 
-## Running it
+### Prioritization
+
+For a record flagged OOB, the flag is wrong if the company is actually active,
+so the likelihood is the confidence it is active. For a record not flagged OOB,
+the likelihood is the opposite. The score is that likelihood times an `impact`
+weight, such as account value. The top of the worklist is the records most
+likely mis-flagged that matter most.
+
+### Safety around the LLM
+
+The model's JSON is validated before use: status and action must come from the
+allowed lists, and confidence must be a number (clamped to 0-100). If the call
+fails or the output is invalid, the agent falls back to the rule engine and
+records why in the `mode` field.
+
+## What is real and what is simulated
+
+| Signal | Source |
+|---|---|
+| Website reachable | Live HTTP request if you provide a website and turn on the live check. Otherwise simulated |
+| Website last update, filing status, news, social, headcount | Simulated, seeded on the company name |
+| LLM reasoning | Real Claude call when `ANTHROPIC_API_KEY` is set |
+
+Because most signals are simulated, outputs show how the pipeline behaves. They
+are not statements about real companies. In a real deployment, each source in
+`signals.py` would be replaced by a connector, such as a Secretary of State
+filing API or a news API.
+
+## Run it
 
 ```bash
 pip install -r requirements.txt
 
-# CLI, single company (works with zero setup):
+# Command line, single company (no setup needed):
 python agent.py "Acme Logistics LLC"
 
-# Full interactive demo:
+# Interactive demo:
 streamlit run app.py
 ```
 
-To enable LLM-based reasoning instead of the rule-based fallback:
+To use Claude for the reasoning step:
 
 ```bash
 export ANTHROPIC_API_KEY=your_key_here
-streamlit run app.py
+export ANTHROPIC_MODEL=claude-sonnet-5-5   # optional override
 ```
 
-## Tech stack
+On Windows PowerShell, use `$env:ANTHROPIC_API_KEY="your_key_here"`.
 
-Python · Anthropic Claude API · Streamlit · Pandas
+### Batch CSV format
 
-## Notes on the demo data
+| Column | Required | Meaning |
+|---|---|---|
+| `company_name` | yes | Company to assess |
+| `website` | no | Used when the live check is on |
+| `oob_flagged` | no | `true` or `false`, default `true` |
+| `impact` | no | Relative value of fixing the record, default `1` |
 
-Signals are deterministically simulated per company name so the project is
-fully runnable without external API keys or network access. In a production
-deployment, each signal source in `signals.py` is swapped for a real
-connector (e.g. Secretary of State filing APIs, a news API, or an internal
-Snowflake/Salesforce query) — the agent and prioritization logic don't change.
+## Tests
+
+```bash
+pytest -v
+```
+
+The tests cover deterministic signals, the ranking logic, LLM output
+validation, the fallback path, and the live website check (with the network
+mocked).
+
+## Limitations
+
+- Most signals are simulated, so there is no accuracy measurement against real
+  company data.
+- The live check only tests whether a website responds. A reachable site does
+  not prove the business is operating, and a down site does not prove it closed.
+- The rule engine's weights are hand-picked, not learned from data.
+
+## Next steps
+
+- Add real connectors for filing status and news.
+- Hand-label a few hundred companies and report precision and recall.
+- Compare the LLM's decisions with the rule engine's.

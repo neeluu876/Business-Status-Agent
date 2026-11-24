@@ -1,34 +1,41 @@
 """
 agent.py
 --------
-Core agent that takes raw company signals and decides:
-  1. status classification   (Active / Likely Active / Uncertain / Likely Defunct / Defunct)
-  2. confidence score         (0-100)
-  3. human-readable reasoning
-  4. recommended action       (No action / Flag for review / Escalate for correction)
+Takes company signals and decides:
+  1. status       (Active / Likely Active / Uncertain / Likely Defunct / Defunct)
+  2. confidence   (0-100, confidence the company is genuinely ACTIVE)
+  3. reasoning    (short explanation)
+  4. action       (No action / Flag for review / Escalate for correction)
 
 Two modes:
-  - LLM mode (default if ANTHROPIC_API_KEY is set): Claude reasons over the
-    signals like an analyst would, and returns structured JSON.
-  - Rule-based fallback mode (no API key required): a transparent, hand-built
-    scoring function so the project is fully runnable/demo-able out of the box.
+  - LLM mode (when ANTHROPIC_API_KEY is set): Claude reasons over the signals
+    and returns JSON, which is validated before use. Any bad output falls back
+    to the rule-based mode.
+  - Rule-based mode (no API key): a transparent scoring function.
 
-This mirrors a real enterprise data-quality workflow: cross-referencing
-multiple weak signals (web presence, filings, news, socials, headcount trend)
-to correct incorrectly-flagged "out of business" records at scale, and to
-prioritize which records to fix first.
+`prioritize_worklist` ranks a batch by how likely each record's current flag
+is wrong, weighted by business impact.
 """
 
-import os
+from __future__ import annotations
+
 import json
-from signals import CompanySignals
+import os
+
+from signals import CompanySignals, get_signals
 
 STATUS_OPTIONS = ["Active", "Likely Active", "Uncertain", "Likely Defunct", "Defunct"]
+ACTION_OPTIONS = [
+    "No action needed",
+    "Flag for manual review",
+    "Escalate: correct OOB flag / remove from active pipeline",
+]
+MODEL_NAME = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-5-5")
 
 
 def _rule_based_assessment(s: CompanySignals) -> dict:
     """Transparent scoring heuristic used when no LLM key is available."""
-    score = 50  # start neutral, out of 100 "confidence company is ACTIVE"
+    score = 50  # start neutral; score = confidence the company is ACTIVE (0-100)
 
     if s.website_active:
         score += 20
@@ -76,21 +83,21 @@ def _rule_based_assessment(s: CompanySignals) -> dict:
         status = "Defunct"
 
     if status in ("Active", "Likely Active"):
-        action = "No action needed"
+        action = ACTION_OPTIONS[0]
     elif status == "Uncertain":
-        action = "Flag for manual review"
+        action = ACTION_OPTIONS[1]
     else:
-        action = "Escalate: correct OOB flag / remove from active pipeline"
+        action = ACTION_OPTIONS[2]
 
-    reasoning_bits = []
-    reasoning_bits.append(
-        "website is active" if s.website_active else "website appears inactive/unreachable"
-    )
-    reasoning_bits.append(f"last updated {s.last_website_update_days_ago}d ago")
-    reasoning_bits.append(f"state filing status: {s.state_filing_status}")
-    reasoning_bits.append(f"{s.news_mentions_last_90_days} news mentions in last 90 days")
-    reasoning_bits.append(f"headcount trend: {s.employee_count_trend}")
-    reasoning = "Based on signals — " + "; ".join(reasoning_bits) + "."
+    reasoning_bits = [
+        "website is active" if s.website_active else "website appears inactive or unreachable",
+        f"website signal is {s.website_source}",
+        f"last updated {s.last_website_update_days_ago}d ago",
+        f"state filing status: {s.state_filing_status}",
+        f"{s.news_mentions_last_90_days} news mentions in last 90 days",
+        f"headcount trend: {s.employee_count_trend}",
+    ]
+    reasoning = "Based on signals: " + "; ".join(reasoning_bits) + "."
 
     return {
         "status": status,
@@ -102,13 +109,12 @@ def _rule_based_assessment(s: CompanySignals) -> dict:
 
 
 def _build_prompt(s: CompanySignals) -> str:
-    return f"""You are a data-quality analyst verifying whether a company record that has
-been auto-flagged as "out of business" (OOB) is actually correct.
+    return f"""You are a data-quality analyst deciding whether a company is still operating.
 
 Company: {s.company_name}
 
 Signals collected:
-- Website active: {s.website_active}
+- Website active: {s.website_active} (source: {s.website_source})
 - Days since last website update: {s.last_website_update_days_ago}
 - News mentions (last 90 days): {s.news_mentions_last_90_days}
 - State filing status: {s.state_filing_status}
@@ -121,69 +127,93 @@ in this exact schema:
   "status": one of {STATUS_OPTIONS},
   "confidence": integer 0-100 (confidence the company is genuinely ACTIVE),
   "reasoning": 1-2 sentence explanation citing the specific signals,
-  "recommended_action": one of ["No action needed", "Flag for manual review", "Escalate: correct OOB flag / remove from active pipeline"]
+  "recommended_action": one of {ACTION_OPTIONS}
 }}"""
+
+
+def parse_llm_response(raw_text: str) -> dict:
+    """Parse and validate the model's JSON. Raises ValueError if it is unusable."""
+    text = raw_text.strip()
+    text = text.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"not valid JSON: {exc}") from exc
+
+    if parsed.get("status") not in STATUS_OPTIONS:
+        raise ValueError(f"invalid status: {parsed.get('status')!r}")
+    if parsed.get("recommended_action") not in ACTION_OPTIONS:
+        raise ValueError(f"invalid action: {parsed.get('recommended_action')!r}")
+    try:
+        confidence = int(parsed["confidence"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("confidence missing or not a number") from exc
+    if not isinstance(parsed.get("reasoning"), str) or not parsed["reasoning"].strip():
+        raise ValueError("reasoning missing")
+
+    parsed["confidence"] = max(0, min(100, confidence))
+    parsed["mode"] = "llm"
+    return parsed
 
 
 def _llm_assessment(s: CompanySignals) -> dict:
     from anthropic import Anthropic
 
-    client = Anthropic()  # reads ANTHROPIC_API_KEY from environment
-    prompt = _build_prompt(s)
-
+    client = Anthropic()  # reads ANTHROPIC_API_KEY from the environment
     response = client.messages.create(
-        model="claude-sonnet-4-5",
+        model=MODEL_NAME,
         max_tokens=300,
-        messages=[{"role": "user", "content": prompt}],
+        messages=[{"role": "user", "content": _build_prompt(s)}],
     )
-
-    raw_text = response.content[0].text.strip()
-    raw_text = raw_text.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-
-    parsed = json.loads(raw_text)
-    parsed["mode"] = "llm"
-    return parsed
+    return parse_llm_response(response.content[0].text)
 
 
-def assess_company(company_name: str) -> dict:
-    """Main entry point: collect signals, run the agent, return a full assessment."""
-    s = get_signals_safe(company_name)
+def assess_company(company_name: str, website: str | None = None,
+                   oob_flagged: bool = True, impact: float = 1.0,
+                   live_checks: bool = False) -> dict:
+    """Collect signals, run the agent, and return a full assessment.
+
+    oob_flagged: True if the record is currently marked out of business.
+    impact: relative business value of fixing this record (for prioritization).
+    """
+    s = get_signals(company_name, website=website, live_checks=live_checks)
 
     if os.environ.get("ANTHROPIC_API_KEY"):
         try:
             result = _llm_assessment(s)
-        except Exception as e:
+        except Exception as e:  # network error, bad output, auth problem, etc.
             result = _rule_based_assessment(s)
             result["mode"] = f"rule-based (LLM call failed: {e})"
     else:
         result = _rule_based_assessment(s)
 
     result["company_name"] = company_name
+    result["oob_flagged"] = oob_flagged
+    result["impact"] = impact
     result["signals"] = s.to_dict()
     return result
 
 
-def get_signals_safe(company_name: str) -> CompanySignals:
-    from signals import get_signals
-    return get_signals(company_name)
+def flag_error_likelihood(assessment: dict) -> float:
+    """Probability (0-1) that the record's current flag is wrong.
+
+    A record flagged out of business is wrong if the company is really active,
+    so the likelihood is the confidence it is active. A record flagged active
+    is wrong if the company is really defunct, so it is the opposite.
+    """
+    active_confidence = assessment["confidence"] / 100
+    if assessment.get("oob_flagged", True):
+        return active_confidence
+    return 1 - active_confidence
 
 
 def prioritize_worklist(assessments: list[dict]) -> list[dict]:
-    """
-    Ranks a batch of assessments by remediation priority:
-    priority = uncertainty (distance of confidence from the extremes) weighted
-    toward companies currently mis-flagged as high-confidence Defunct/Active,
-    since those are the most likely to be *wrong* and highest-value to fix first.
-    """
-    def priority_score(a: dict) -> float:
-        conf = a["confidence"]
-        # Highest priority: confidently "Active" signals but currently sitting
-        # in a defunct-flagged pipeline (biggest business impact if wrong),
-        # and mid-confidence "Uncertain" cases needing review.
-        distance_from_middle = abs(conf - 50)
-        return distance_from_middle if a["status"] in ("Active", "Defunct") else distance_from_middle * 0.6
+    """Rank records by (likelihood the flag is wrong) x (impact of fixing it)."""
+    for a in assessments:
+        a["flag_error_likelihood"] = round(flag_error_likelihood(a), 3)
+        a["priority_score"] = round(a["flag_error_likelihood"] * a.get("impact", 1.0), 3)
 
-    ranked = sorted(assessments, key=priority_score, reverse=True)
+    ranked = sorted(assessments, key=lambda a: a["priority_score"], reverse=True)
     for i, a in enumerate(ranked, start=1):
         a["priority_rank"] = i
     return ranked
@@ -191,6 +221,6 @@ def prioritize_worklist(assessments: list[dict]) -> list[dict]:
 
 if __name__ == "__main__":
     import sys
+
     name = sys.argv[1] if len(sys.argv) > 1 else "Acme Logistics LLC"
-    result = assess_company(name)
-    print(json.dumps(result, indent=2))
+    print(json.dumps(assess_company(name), indent=2))

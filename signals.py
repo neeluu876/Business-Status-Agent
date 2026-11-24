@@ -1,22 +1,26 @@
 """
 signals.py
------------
-Generates the raw "signals" an analyst would normally pull from disparate
-systems (website checks, state filing records, news mentions, social activity,
-D&B-style firmographic feeds) before deciding whether a company is truly
-active or out-of-business (OOB).
+----------
+Collects the signals an analyst would use to decide whether a company is
+still operating: website status, filing status, news, social activity, and
+headcount trend.
 
-For this public demo, signals are deterministically simulated (seeded on the
-company name) so the project runs with zero external API keys or network
-access. In a production setting, each `get_*` function below would be swapped
-for a real connector (e.g. a website uptime check, Secretary of State filing
-API, a news API, or a D&B/Snowflake query) without changing anything else in
-the pipeline.
+Only one signal can be real in this public demo: website reachability. If a
+website URL is provided and live checks are enabled, `website_active` comes
+from an actual HTTP request. Every other signal is simulated, deterministically
+seeded on the company name, so the project runs with no API keys.
+
+The `website_source` field records where the website signal came from, so a
+reader can always tell real data from simulated data.
 """
+
+from __future__ import annotations
 
 import hashlib
 import random
 from dataclasses import dataclass, asdict
+
+import requests
 
 
 @dataclass
@@ -28,6 +32,7 @@ class CompanySignals:
     state_filing_status: str  # active | delinquent | dissolved | unknown
     social_media_last_post_days_ago: int
     employee_count_trend: str  # growing | stable | declining | unknown
+    website_source: str = "simulated"  # simulated | live
 
     def to_dict(self):
         return asdict(self)
@@ -39,7 +44,29 @@ def _seeded_rng(company_name: str) -> random.Random:
     return random.Random(seed)
 
 
-def get_signals(company_name: str) -> CompanySignals:
+def check_website(url: str, timeout: float = 5.0) -> bool:
+    """Return True if the URL answers with a non-error status code.
+
+    Any network error, timeout, or HTTP status of 400 or higher counts as
+    inactive. This is a reachability check only. It does not prove the
+    business is operating.
+    """
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    try:
+        response = requests.get(
+            url,
+            timeout=timeout,
+            allow_redirects=True,
+            headers={"User-Agent": "business-status-agent-demo/1.0"},
+        )
+        return response.status_code < 400
+    except requests.RequestException:
+        return False
+
+
+def get_signals(company_name: str, website: str | None = None,
+                live_checks: bool = False) -> CompanySignals:
     rng = _seeded_rng(company_name)
 
     website_active = rng.random() > 0.25
@@ -62,6 +89,13 @@ def get_signals(company_name: str) -> CompanySignals:
         weights=[0.25, 0.35, 0.25, 0.15],
     )[0]
 
+    source = "simulated"
+    if live_checks and website:
+        website_active = check_website(website)
+        source = "live"
+        if not website_active:
+            last_update = max(last_update, 180)
+
     return CompanySignals(
         company_name=company_name,
         website_active=website_active,
@@ -70,4 +104,5 @@ def get_signals(company_name: str) -> CompanySignals:
         state_filing_status=filing_status,
         social_media_last_post_days_ago=social_last_post,
         employee_count_trend=employee_trend,
+        website_source=source,
     )
