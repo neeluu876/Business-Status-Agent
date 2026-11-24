@@ -1,7 +1,0 @@
-============================= test session starts =============================
-platform win32 -- Python 3.12.10, pytest-9.2.0, pluggy-1.7.0
-rootdir: C:\Users\nrmeh\github\Business-Status-Agent
-plugins: anyio-4.16.0
-collected 0 items
-
-============================ no tests ran in 0.08s ============================
